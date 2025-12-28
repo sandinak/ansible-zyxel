@@ -1,0 +1,103 @@
+---
+# Integration tests for zyxel management modules (syslog, ntp, user)
+
+- name: Test syslog configuration
+  block:
+    - name: Configure syslog server
+      network.zyxel.zyxel_syslog:
+        server: "192.168.1.100"
+        port: 514
+        facility: local7
+        severity: info
+        state: present
+      register: result
+
+    - name: Verify syslog configured
+      ansible.builtin.assert:
+        that:
+          - result is changed
+        fail_msg: "Syslog configuration failed"
+
+    - name: Remove syslog server
+      network.zyxel.zyxel_syslog:
+        server: "192.168.1.100"
+        state: absent
+      register: result
+
+- name: Test NTP configuration
+  block:
+    - name: Configure NTP server
+      network.zyxel.zyxel_ntp:
+        server: "pool.ntp.org"
+        prefer: true
+        state: present
+      register: result
+
+    - name: Verify NTP configured
+      ansible.builtin.assert:
+        that:
+          - result is changed
+        fail_msg: "NTP configuration failed"
+
+    - name: Configure NTP with timezone
+      network.zyxel.zyxel_ntp:
+        server: "time.google.com"
+        timezone: "-5"
+        state: present
+      register: result
+
+    - name: Remove NTP servers (cleanup)
+      network.zyxel.zyxel_ntp:
+        server: "{{ item }}"
+        state: absent
+      loop:
+        - "pool.ntp.org"
+        - "time.google.com"
+      ignore_errors: true
+
+- name: Test user configuration
+  block:
+    - name: Create test user
+      network.zyxel.zyxel_user:
+        name: "testuser"
+        password: "TestPass123!"
+        privilege: user
+        state: present
+      register: result
+
+    - name: Verify user created
+      ansible.builtin.assert:
+        that:
+          - result is changed
+        fail_msg: "User creation failed"
+
+    - name: Update user privilege
+      network.zyxel.zyxel_user:
+        name: "testuser"
+        privilege: admin
+        state: present
+      register: result
+
+    - name: Delete test user (cleanup)
+      network.zyxel.zyxel_user:
+        name: "testuser"
+        state: absent
+      register: result
+
+    - name: Verify user deleted
+      ansible.builtin.assert:
+        that:
+          - result is changed
+        fail_msg: "User deletion failed"
+
+  rescue:
+    - name: Cleanup on failure
+      network.zyxel.zyxel_user:
+        name: "testuser"
+        state: absent
+      ignore_errors: true
+
+    - name: Test failed
+      ansible.builtin.fail:
+        msg: "User management integration tests failed"
+

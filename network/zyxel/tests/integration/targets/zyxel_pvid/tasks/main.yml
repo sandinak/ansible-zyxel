@@ -1,0 +1,58 @@
+---
+# Integration tests for zyxel_pvid module
+
+- name: Test PVID configuration
+  block:
+    - name: Set PVID for port 1 to VLAN 100
+      network.zyxel.zyxel_pvid:
+        port: "1"
+        pvid: 100
+      register: result
+
+    - name: Verify PVID set
+      ansible.builtin.assert:
+        that:
+          - result is changed
+        fail_msg: "PVID configuration failed"
+
+    - name: Set same PVID again (idempotency)
+      network.zyxel.zyxel_pvid:
+        port: "1"
+        pvid: 100
+      register: result
+
+    - name: Verify idempotency
+      ansible.builtin.assert:
+        that:
+          - result is not changed
+        fail_msg: "PVID idempotency check failed"
+
+    - name: Change PVID to different VLAN
+      network.zyxel.zyxel_pvid:
+        port: "1"
+        pvid: 200
+      register: result
+
+    - name: Verify PVID changed
+      ansible.builtin.assert:
+        that:
+          - result is changed
+        fail_msg: "PVID change failed"
+
+    - name: Reset PVID to default (cleanup)
+      network.zyxel.zyxel_pvid:
+        port: "1"
+        pvid: 1
+      register: result
+
+  rescue:
+    - name: Cleanup on failure
+      network.zyxel.zyxel_pvid:
+        port: "1"
+        pvid: 1
+      ignore_errors: true
+
+    - name: Test failed
+      ansible.builtin.fail:
+        msg: "PVID integration tests failed"
+

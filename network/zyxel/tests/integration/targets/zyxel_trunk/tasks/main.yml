@@ -1,0 +1,86 @@
+---
+# Integration tests for zyxel_trunk module
+
+- name: Test trunk configuration
+  block:
+    - name: Create static trunk group
+      network.zyxel.zyxel_trunk:
+        group: 1
+        members:
+          - "1"
+          - "2"
+        mode: static
+        state: present
+      register: result
+
+    - name: Verify trunk created
+      ansible.builtin.assert:
+        that:
+          - result is changed
+        fail_msg: "Trunk creation failed"
+
+    - name: Create trunk again (idempotency)
+      network.zyxel.zyxel_trunk:
+        group: 1
+        members:
+          - "1"
+          - "2"
+        mode: static
+        state: present
+      register: result
+
+    - name: Verify idempotency
+      ansible.builtin.assert:
+        that:
+          - result is not changed
+        fail_msg: "Trunk idempotency check failed"
+
+    - name: Create LACP trunk
+      network.zyxel.zyxel_trunk:
+        group: 2
+        members:
+          - "3"
+          - "4"
+        mode: lacp
+        lacp_mode: active
+        state: present
+      register: result
+
+    - name: Verify LACP trunk created
+      ansible.builtin.assert:
+        that:
+          - result is changed
+        fail_msg: "LACP trunk creation failed"
+
+    - name: Delete trunk group 2
+      network.zyxel.zyxel_trunk:
+        group: 2
+        state: absent
+      register: result
+
+    - name: Verify trunk deleted
+      ansible.builtin.assert:
+        that:
+          - result is changed
+        fail_msg: "Trunk deletion failed"
+
+    - name: Delete trunk group 1 (cleanup)
+      network.zyxel.zyxel_trunk:
+        group: 1
+        state: absent
+      register: result
+
+  rescue:
+    - name: Cleanup on failure
+      network.zyxel.zyxel_trunk:
+        group: "{{ item }}"
+        state: absent
+      loop:
+        - 1
+        - 2
+      ignore_errors: true
+
+    - name: Test failed
+      ansible.builtin.fail:
+        msg: "Trunk integration tests failed"
+

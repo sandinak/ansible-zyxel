@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+namespace: network
+name: zyxel
+version: 1.2.0
+readme: README.md
+
+authors:
+  - Ansible Network Team
+
+description: Ansible collection for managing Zyxel switches including ports, VLANs, and management features
+
+license:
+  - GPL-3.0-or-later
+
+tags:
+  - networking
+  - zyxel
+  - switch
+  - vlan
+  - network_automation
+
+dependencies:
+  ansible.netcommon: ">=2.0.0"
+
+repository: https://github.com/sandinak/ansible-zyxel
+documentation: https://github.com/sandinak/ansible-zyxel/blob/main/docs/
+homepage: https://github.com/sandinak/ansible-zyxel
+issues: https://github.com/sandinak/ansible-zyxel/issues
+
+build_ignore:
+  - "*.tar.gz"
+  - ".pytest_cache"
+  - "__pycache__"
+  - ".venv"
+  - "venv"
+  - ".git"
+  - ".gitignore"
+  - "tests/"
+

@@ -1,0 +1,15 @@
+---
+# Integration test configuration template
+# Copy this file to integration_config.yml and fill in your device details
+
+# Zyxel switch connection details
+zyxel_host: "192.168.1.1"
+zyxel_user: "admin"
+zyxel_password: "password"
+zyxel_port: 22
+
+# Test configuration
+test_vlan_id: 999
+test_port: "1"
+test_trunk_group: 1
+

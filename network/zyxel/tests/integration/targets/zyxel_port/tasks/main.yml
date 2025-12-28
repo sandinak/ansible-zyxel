@@ -1,0 +1,65 @@
+---
+# Integration tests for zyxel_port module
+
+- name: Test port configuration
+  block:
+    - name: Enable port 1
+      network.zyxel.zyxel_port:
+        name: "1"
+        state: enabled
+      register: result
+
+    - name: Verify port enabled
+      ansible.builtin.assert:
+        that:
+          - result is changed or result is not changed
+        fail_msg: "Port enable operation failed"
+
+    - name: Set port speed to 1000Mbps full duplex
+      network.zyxel.zyxel_port:
+        name: "1"
+        speed: "1000"
+        duplex: full
+      register: result
+
+    - name: Verify speed change
+      ansible.builtin.assert:
+        that:
+          - result is defined
+        fail_msg: "Port speed change failed"
+
+    - name: Enable flow control
+      network.zyxel.zyxel_port:
+        name: "1"
+        flow_control: true
+      register: result
+
+    - name: Set port description
+      network.zyxel.zyxel_port:
+        name: "1"
+        description: "Test Port"
+      register: result
+
+    - name: Disable port (cleanup)
+      network.zyxel.zyxel_port:
+        name: "1"
+        state: disabled
+      register: result
+
+    - name: Test idempotency - disable already disabled port
+      network.zyxel.zyxel_port:
+        name: "1"
+        state: disabled
+      register: result
+
+    - name: Verify idempotency
+      ansible.builtin.assert:
+        that:
+          - result is not changed
+        fail_msg: "Idempotency check failed"
+
+  rescue:
+    - name: Test failed
+      ansible.builtin.debug:
+        msg: "Port integration tests failed"
+

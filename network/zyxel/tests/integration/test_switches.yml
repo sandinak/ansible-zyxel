@@ -1,0 +1,53 @@
+---
+# Integration test playbook for Zyxel switches
+# Tests HTTP API connectivity and basic operations on all three switch types
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.yml tests/integration/test_switches.yml --ask-vault-pass
+
+- name: Test Zyxel Switch HTTP API
+  hosts: zyxel_switches
+  gather_facts: false
+
+  vars:
+    ansible_connection: ansible.netcommon.httpapi
+    ansible_network_os: network.zyxel.zyxel
+    ansible_httpapi_use_ssl: true
+    ansible_httpapi_validate_certs: false
+    # Credentials should come from inventory or vault
+    # ansible_user: "{{ vault_zyxel_user }}"
+    # ansible_password: "{{ vault_zyxel_password }}"
+
+  tasks:
+    - name: Display switch being tested
+      debug:
+        msg: "Testing {{ inventory_hostname }} ({{ zyxel_model }}) at {{ ansible_host }}"
+
+    - name: Get port information
+      network.zyxel.zyxel_ports_info:
+      register: ports_result
+      ignore_errors: true
+
+    - name: Display port count
+      debug:
+        msg: "Found {{ ports_result.ports | length }} ports"
+      when: ports_result.ports is defined
+
+    - name: Get VLAN information
+      network.zyxel.zyxel_vlans_info:
+      register: vlans_result
+      ignore_errors: true
+
+    - name: Display VLAN count
+      debug:
+        msg: "Found {{ vlans_result.vlans | length }} VLANs"
+      when: vlans_result.vlans is defined
+
+    - name: Test summary
+      debug:
+        msg: |
+          Switch: {{ inventory_hostname }}
+          Model: {{ zyxel_model }}
+          Ports: {{ ports_result.ports | length | default(0) }}
+          VLANs: {{ vlans_result.vlans | length | default(0) }}
+

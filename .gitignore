@@ -1,0 +1,60 @@
+# Python virtual environment
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Ansible
+*.retry
+.cache/
+collections/
+
+# Local Ansible testing (keep for local testing, don't commit)
+inventory/
+ansible.cfg
+playbooks/
+roles/
+sourceme
+requirements.yml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets (never commit these)
+*.vault
+secrets.yml
+**/host_vars/*/vault.yml
+# Vault files should be encrypted before commit
+# **/group_vars/*/vault.yml
+
+# Logs
+*.log
+logs/
+
+# Build artifacts
+*.tar.gz
+
+# Temporary files
+*.tmp
+*.bak
+*.saved

@@ -1,0 +1,94 @@
+---
+# Integration tests for zyxel_vlan module
+
+- name: Test VLAN configuration
+  block:
+    - name: Create VLAN 100
+      network.zyxel.zyxel_vlan:
+        vlan_id: 100
+        name: "TestVLAN"
+        state: present
+      register: result
+
+    - name: Verify VLAN created
+      ansible.builtin.assert:
+        that:
+          - result is changed
+        fail_msg: "VLAN creation failed"
+
+    - name: Create VLAN 100 again (idempotency)
+      network.zyxel.zyxel_vlan:
+        vlan_id: 100
+        name: "TestVLAN"
+        state: present
+      register: result
+
+    - name: Verify idempotency
+      ansible.builtin.assert:
+        that:
+          - result is not changed
+        fail_msg: "VLAN idempotency check failed"
+
+    - name: Update VLAN name
+      network.zyxel.zyxel_vlan:
+        vlan_id: 100
+        name: "UpdatedVLAN"
+        state: present
+      register: result
+
+    - name: Verify VLAN updated
+      ansible.builtin.assert:
+        that:
+          - result is changed
+        fail_msg: "VLAN update failed"
+
+    - name: Create VLAN with port assignments
+      network.zyxel.zyxel_vlan:
+        vlan_id: 200
+        name: "DataVLAN"
+        tagged_ports:
+          - "24"
+        untagged_ports:
+          - "1"
+          - "2"
+        state: present
+      register: result
+
+    - name: Verify VLAN with ports created
+      ansible.builtin.assert:
+        that:
+          - result is changed
+        fail_msg: "VLAN with ports creation failed"
+
+    - name: Delete VLAN 200
+      network.zyxel.zyxel_vlan:
+        vlan_id: 200
+        state: absent
+      register: result
+
+    - name: Verify VLAN deleted
+      ansible.builtin.assert:
+        that:
+          - result is changed
+        fail_msg: "VLAN deletion failed"
+
+    - name: Delete VLAN 100 (cleanup)
+      network.zyxel.zyxel_vlan:
+        vlan_id: 100
+        state: absent
+      register: result
+
+  rescue:
+    - name: Cleanup on failure
+      network.zyxel.zyxel_vlan:
+        vlan_id: "{{ item }}"
+        state: absent
+      loop:
+        - 100
+        - 200
+      ignore_errors: true
+
+    - name: Test failed
+      ansible.builtin.fail:
+        msg: "VLAN integration tests failed"
+
