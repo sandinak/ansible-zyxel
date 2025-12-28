@@ -27,8 +27,10 @@ This repository contains:
 ### 1. Install the Collection
 
 ```bash
-# Install from this repository
-cd network/zyxel
+# Install from GitHub
+ansible-galaxy collection install git+https://github.com/sandinak/ansible-zyxel.git
+
+# Or build and install locally
 ansible-galaxy collection build
 ansible-galaxy collection install network-zyxel-*.tar.gz
 
@@ -108,7 +110,6 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 # Run tests
-cd network/zyxel
 python -m pytest tests/unit/ -v
 
 # Build collection
