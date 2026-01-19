@@ -34,12 +34,20 @@ options:
     default: 'present'
   tagged_ports:
     description:
-      - List of ports that should be tagged members of this VLAN.
+      - List of ports that should be tagged members of this VLAN (fixed, TX tagged).
+      - These are typically trunk ports that carry multiple VLANs.
     type: list
     elements: str
   untagged_ports:
     description:
-      - List of ports that should be untagged members of this VLAN.
+      - List of ports that should be untagged members of this VLAN (fixed, TX untagged).
+      - These are typically access ports for this VLAN.
+    type: list
+    elements: str
+  forbidden_ports:
+    description:
+      - List of ports that should be excluded from this VLAN.
+      - Traffic for this VLAN will not be forwarded on these ports.
     type: list
     elements: str
 notes:
@@ -142,6 +150,7 @@ def main():
         state=dict(type='str', choices=['present', 'absent'], default='present'),
         tagged_ports=dict(type='list', elements='str'),
         untagged_ports=dict(type='list', elements='str'),
+        forbidden_ports=dict(type='list', elements='str'),
         num_ports=dict(type='int', default=28),
     )
 
@@ -157,6 +166,7 @@ def main():
     name = module.params.get('name')
     tagged_ports = module.params.get('tagged_ports') or []
     untagged_ports = module.params.get('untagged_ports') or []
+    forbidden_ports = module.params.get('forbidden_ports') or []
     num_ports = module.params.get('num_ports', 28)
 
     # Get connection to device
@@ -177,7 +187,17 @@ def main():
         else:
             result['msg'] = 'VLAN %s does not exist' % vlan_id
     else:  # state == 'present'
-        if needs_update(current, module.params):
+        # Check if ports are specified - this is critical for safe VLAN operations
+        ports_specified = bool(tagged_ports or untagged_ports or forbidden_ports)
+        vlan_exists = current.get('exists', False)
+
+        # SAFETY: If VLAN exists and no ports specified, skip create_vlan entirely
+        # The GS1920 web form clears port membership when submitted without port settings,
+        # which breaks management connectivity if applied to VLAN 1 (management VLAN)
+        if vlan_exists and not ports_specified:
+            result['changed'] = False
+            result['msg'] = 'VLAN %s exists (skipping update - no port changes specified)' % vlan_id
+        elif needs_update(current, module.params):
             result['changed'] = True
             result['commands'] = ['vlan %s' % vlan_id]
             if name:
@@ -186,6 +206,8 @@ def main():
                 result['commands'].append('tagged %s' % ','.join(str(p) for p in tagged_ports))
             if untagged_ports:
                 result['commands'].append('untagged %s' % ','.join(str(p) for p in untagged_ports))
+            if forbidden_ports:
+                result['commands'].append('forbidden %s' % ','.join(str(p) for p in forbidden_ports))
 
             if not module.check_mode:
                 # Pass config as a dict to avoid RPC issues with 'name' parameter
@@ -195,6 +217,7 @@ def main():
                     'vlan_name': str(name) if name else '',
                     'tagged_ports': list(tagged_ports) if tagged_ports else [],
                     'untagged_ports': list(untagged_ports) if untagged_ports else [],
+                    'forbidden_ports': list(forbidden_ports) if forbidden_ports else [],
                     'num_ports': int(num_ports),
                 }
                 response = connection.create_vlan(vlan_config)

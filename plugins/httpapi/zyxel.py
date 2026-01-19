@@ -228,11 +228,18 @@ class HttpApi(HttpApiBase):
 
         self._auth_id = response.strip()
 
-        # Verify login
+        # Check if login was rejected (some firmware returns error message)
+        if 'error' in response.lower() or 'fail' in response.lower() or 'invalid' in response.lower():
+            raise Exception('GS1900 login failed: %s' % response[:100])
+
+        # Verify login - some GS1900 firmware doesn't require this step
         verify_payload = {'authId': self._auth_id, 'login_chk': 'true'}
         code, response = self.send_request('/cgi-bin/dispatcher.cgi', verify_payload, method='POST')
-        if 'OK' not in response:
-            raise Exception('GS1900 login verification failed')
+        # Accept OK, or empty response (some firmware), or any 200 response without error
+        if code != 200:
+            raise Exception('GS1900 login verification failed: HTTP %d' % code)
+        if 'error' in response.lower() or 'fail' in response.lower():
+            raise Exception('GS1900 login verification failed: %s' % response[:100])
 
     def logout(self):
         """Logout from the switch."""
@@ -848,8 +855,9 @@ class HttpApi(HttpApiBase):
             config: Dict with keys:
                 - vlan_id: VLAN ID (1-4094)
                 - vlan_name: VLAN name (optional)
-                - tagged_ports: List of port numbers for tagged membership
-                - untagged_ports: List of port numbers for untagged membership
+                - tagged_ports: List of port numbers for tagged membership (fixed, TX tagged)
+                - untagged_ports: List of port numbers for untagged membership (fixed, TX untagged)
+                - forbidden_ports: List of port numbers to exclude from VLAN
                 - num_ports: Total number of ports on the switch (default 28)
 
         Returns:
@@ -859,22 +867,35 @@ class HttpApi(HttpApiBase):
         vlan_name = config.get('vlan_name')
         tagged_ports = config.get('tagged_ports', [])
         untagged_ports = config.get('untagged_ports', [])
+        forbidden_ports = config.get('forbidden_ports', [])
         num_ports = config.get('num_ports', 28)
 
         model = self.detect_model()
         if model == 'gs1900':
             success, msg = self._create_vlan_gs1900(vlan_id, vlan_name, tagged_ports, untagged_ports)
         elif model == 'gs1915':
-            success, msg = self._create_vlan_gs1915(vlan_id, vlan_name, tagged_ports, untagged_ports, num_ports)
+            success, msg = self._create_vlan_gs1915(vlan_id, vlan_name, tagged_ports, untagged_ports, forbidden_ports, num_ports)
         else:  # gs1920
-            success, msg = self._create_vlan_gs1920(vlan_id, vlan_name, tagged_ports, untagged_ports, num_ports)
+            success, msg = self._create_vlan_gs1920(vlan_id, vlan_name, tagged_ports, untagged_ports, forbidden_ports, num_ports)
 
         return {'success': success, 'msg': msg}
 
-    def _create_vlan_gs1915(self, vlan_id, name, tagged_ports, untagged_ports, num_ports):
-        """Create VLAN on GS1915 series."""
+    def _create_vlan_gs1915(self, vlan_id, name, tagged_ports, untagged_ports, forbidden_ports, num_ports):
+        """Create VLAN on GS1915 series.
+
+        When tagged_ports, untagged_ports, and forbidden_ports are all empty, we only update
+        the VLAN name and preserve existing port membership to avoid breaking management connectivity.
+
+        Port membership types:
+        - tagged_ports: Fixed member, TX tagged (trunk ports)
+        - untagged_ports: Fixed member, TX untagged (access ports)
+        - forbidden_ports: Excluded from VLAN
+        - All other ports: Normal (dynamic/GVRP)
+        """
         tagged_ports = [str(p) for p in (tagged_ports or [])]
         untagged_ports = [str(p) for p in (untagged_ports or [])]
+        forbidden_ports = [str(p) for p in (forbidden_ports or [])]
+        ports_specified = bool(tagged_ports or untagged_ports or forbidden_ports)
 
         # Build the VLAN creation form as list of tuples
         form_data = [
@@ -888,28 +909,46 @@ class HttpApi(HttpApiBase):
             ('rpvlantag_HidOldSlot', '0'),
         ]
 
-        # Set port membership for each port
-        # RpgControl: 0=Normal(not member), 1=Fixed(member), 2=Forbidden
-        # ChkTagging: checked=TX tagged, unchecked=TX untagged
-        for port in range(1, num_ports + 1):
-            port_str = str(port)
-            if port_str in tagged_ports:
-                form_data.append(('rpvlantag_RpgControl?%d' % port, '1'))
-                form_data.append(('rpvlantag_ChkTagging', '?%d' % port))
-            elif port_str in untagged_ports:
-                form_data.append(('rpvlantag_RpgControl?%d' % port, '1'))
-            else:
-                form_data.append(('rpvlantag_RpgControl?%d' % port, '0'))
+        # Only set port membership if ports were explicitly specified
+        # This preserves existing membership when only updating the VLAN name
+        # CRITICAL: For VLAN 1 (management VLAN), clearing ports breaks connectivity!
+        if ports_specified:
+            # Set port membership for each port
+            # RpgControl: 0=Normal(dynamic/GVRP), 1=Fixed(static member), 2=Forbidden
+            # ChkTagging: checked=TX tagged, unchecked=TX untagged
+            for port in range(1, num_ports + 1):
+                port_str = str(port)
+                if port_str in tagged_ports:
+                    form_data.append(('rpvlantag_RpgControl?%d' % port, '1'))
+                    form_data.append(('rpvlantag_ChkTagging', '?%d' % port))
+                elif port_str in untagged_ports:
+                    form_data.append(('rpvlantag_RpgControl?%d' % port, '1'))
+                elif port_str in forbidden_ports:
+                    form_data.append(('rpvlantag_RpgControl?%d' % port, '2'))
+                else:
+                    form_data.append(('rpvlantag_RpgControl?%d' % port, '0'))
 
         code, response = self.post_form('/Forms/rpvlantag_1', form_data)
         if code == 200 and 'Error' not in response:
             return True, 'VLAN %s created' % vlan_id
         return False, 'Failed to create VLAN %s: HTTP %d' % (vlan_id, code)
 
-    def _create_vlan_gs1920(self, vlan_id, name, tagged_ports, untagged_ports, num_ports):
-        """Create VLAN on GS1920 series."""
+    def _create_vlan_gs1920(self, vlan_id, name, tagged_ports, untagged_ports, forbidden_ports, num_ports):
+        """Create VLAN on GS1920 series.
+
+        When tagged_ports, untagged_ports, and forbidden_ports are all empty, we only update
+        the VLAN name and preserve existing port membership to avoid breaking management connectivity.
+
+        Port membership types:
+        - tagged_ports: Fixed member, TX tagged (trunk ports)
+        - untagged_ports: Fixed member, TX untagged (access ports)
+        - forbidden_ports: Excluded from VLAN
+        - All other ports: Normal (dynamic/GVRP)
+        """
         tagged_ports = [str(p) for p in (tagged_ports or [])]
         untagged_ports = [str(p) for p in (untagged_ports or [])]
+        forbidden_ports = [str(p) for p in (forbidden_ports or [])]
+        ports_specified = bool(tagged_ports or untagged_ports or forbidden_ports)
 
         # First, open the add dialog (NumID=2)
         data = {
@@ -927,18 +966,24 @@ class HttpApi(HttpApiBase):
             ('rpVlantag_HidBtn_NumID', '5'),  # Apply/Create
         ]
 
-        # Set port membership for each port
-        # Rdo_Control: 0=Normal(not member), 1=Fixed(member), 2=Forbidden
-        # Chk_Tagging: checked=TX tagged, unchecked=TX untagged
-        for port in range(1, num_ports + 1):
-            port_str = str(port)
-            if port_str in tagged_ports:
-                form_data.append(('rpVlantag_Toggle_Rdo_Control?%d' % port, '1'))
-                form_data.append(('rpVlantag_Toggle_Chk_Tagging', '?%d' % port))
-            elif port_str in untagged_ports:
-                form_data.append(('rpVlantag_Toggle_Rdo_Control?%d' % port, '1'))
-            else:
-                form_data.append(('rpVlantag_Toggle_Rdo_Control?%d' % port, '0'))
+        # Only set port membership if ports were explicitly specified
+        # This preserves existing membership when only updating the VLAN name
+        # CRITICAL: For VLAN 1 (management VLAN), clearing ports breaks connectivity!
+        if ports_specified:
+            # Set port membership for each port
+            # Rdo_Control: 0=Normal(dynamic/GVRP), 1=Fixed(static member), 2=Forbidden
+            # Chk_Tagging: checked=TX tagged, unchecked=TX untagged
+            for port in range(1, num_ports + 1):
+                port_str = str(port)
+                if port_str in tagged_ports:
+                    form_data.append(('rpVlantag_Toggle_Rdo_Control?%d' % port, '1'))
+                    form_data.append(('rpVlantag_Toggle_Chk_Tagging', '?%d' % port))
+                elif port_str in untagged_ports:
+                    form_data.append(('rpVlantag_Toggle_Rdo_Control?%d' % port, '1'))
+                elif port_str in forbidden_ports:
+                    form_data.append(('rpVlantag_Toggle_Rdo_Control?%d' % port, '2'))
+                else:
+                    form_data.append(('rpVlantag_Toggle_Rdo_Control?%d' % port, '0'))
 
         code, response = self.post_form('/Forms/rpVlantag_1', form_data)
         if code == 200 and 'Error' not in response:
@@ -1082,6 +1127,144 @@ class HttpApi(HttpApiBase):
                 port_id, pvid, num_ports, vlan_trunking,
                 ingress_filtering, acceptable_frame_type
             )
+
+    def set_all_port_pvids(self, port_settings, num_ports=28):
+        """Set PVID and VLAN settings for multiple ports in a single API call.
+
+        This is much more efficient than calling set_port_pvid in a loop,
+        as it only makes one HTTP request to configure all ports.
+
+        Args:
+            port_settings: Dict mapping port number (str) to settings dict.
+                           Each settings dict can have: pvid, vlan_trunking,
+                           ingress_filtering, acceptable_frame_type
+            num_ports: Total number of ports on the switch
+
+        Returns:
+            Tuple of (success, message)
+        """
+        model = self.detect_model()
+        if model == 'gs1900':
+            return self._set_all_port_pvids_gs1900(port_settings)
+        elif model == 'gs1915':
+            return self._set_all_port_pvids_gs1915(port_settings, num_ports)
+        else:  # gs1920
+            return self._set_all_port_pvids_gs1920(port_settings, num_ports)
+
+    def _set_all_port_pvids_gs1915(self, port_settings, num_ports):
+        """Bulk set port PVIDs on GS1915 series."""
+        # Get current port VLAN settings
+        content = self.get_page('/rpvlanport.html')
+        current_settings = self._parse_vlan_port_settings(content)
+
+        # Build form data for all ports
+        form_data = [('rpvlanport_HidBtnNum', '1')]  # Apply
+
+        for port in range(1, num_ports + 1):
+            port_str = str(port)
+            current = current_settings.get(port_str, {})
+            new_settings = port_settings.get(port_str, {})
+
+            # Set PVID
+            pvid = new_settings.get('pvid', current.get('pvid', 1))
+            form_data.append(('rpvlanport_IptPVID?%d' % port, str(pvid)))
+
+            # VLAN Trunking checkbox
+            if 'vlan_trunking' in new_settings:
+                set_trunking = new_settings['vlan_trunking']
+            else:
+                set_trunking = current.get('vlan_trunking', False)
+            if set_trunking:
+                form_data.append(('rpvlanport_ChkVLANTrunking', '?%d' % port))
+
+        code, response = self.post_form('/Forms/rpvlanport_1', form_data)
+        if code == 200 and 'Error' not in response:
+            return True, 'Configured %d ports' % len(port_settings)
+        return False, 'Failed to configure port PVIDs'
+
+    def _set_all_port_pvids_gs1920(self, port_settings, num_ports):
+        """Bulk set port PVIDs on GS1920 series."""
+        # Get current port VLAN settings
+        content = self.get_page('/rpVlanport.html')
+        current_settings = self._parse_vlan_port_settings(content)
+
+        # Build form data for all ports
+        form_data = [('rpVlanport_HidBtn_NumID', '1')]  # Apply
+
+        for port in range(1, num_ports + 1):
+            port_str = str(port)
+            current = current_settings.get(port_str, {})
+            new_settings = port_settings.get(port_str, {})
+
+            # Set PVID
+            pvid = new_settings.get('pvid', current.get('pvid', 1))
+            form_data.append(('rpVlanport_Ipt_PVID?%d' % port, str(pvid)))
+
+            # Acceptable frame type
+            if 'acceptable_frame_type' in new_settings:
+                aft = new_settings['acceptable_frame_type']
+            else:
+                aft = current.get('acceptable_frame_type', 'all')
+            aft_map = {'all': '00000000', 'tagged': '00000001', 'untagged': '00000002'}
+            form_data.append(('rpVlanport_Slt_AcceptableFrame?%d' % port, aft_map.get(aft, '00000000')))
+
+            # Ingress filtering checkbox
+            if 'ingress_filtering' in new_settings:
+                set_ingress = new_settings['ingress_filtering']
+            else:
+                set_ingress = current.get('ingress_filtering', False)
+            if set_ingress:
+                form_data.append(('rpVlanport_Chk_Ingress', '?%d' % port))
+
+            # VLAN Trunking checkbox
+            if 'vlan_trunking' in new_settings:
+                set_trunking = new_settings['vlan_trunking']
+            else:
+                set_trunking = current.get('vlan_trunking', False)
+            if set_trunking:
+                form_data.append(('rpVlanport_Chk_VLANTrunking', '?%d' % port))
+
+        code, response = self.post_form('/Forms/rpVlanport_1', form_data)
+        if code == 200 and 'Error' not in response:
+            return True, 'Configured %d ports' % len(port_settings)
+        return False, 'Failed to configure port PVIDs'
+
+    def _set_all_port_pvids_gs1900(self, port_settings):
+        """Bulk set port PVIDs on GS1900 series.
+
+        GS1900 doesn't support bulk configuration via a single form,
+        so we iterate but share the XSSID token.
+        """
+        xssid = self._get_gs1900_xssid(1291)
+        if not xssid:
+            return False, 'Failed to get XSSID token'
+
+        success_count = 0
+        for port_str, settings in port_settings.items():
+            pvid = settings.get('pvid', 1)
+            vlan_trunking = settings.get('vlan_trunking', False)
+            ingress_filtering = settings.get('ingress_filtering', False)
+            acceptable_frame_type = settings.get('acceptable_frame_type', 'all')
+
+            frametype_map = {'all': '0', 'tagged': '1', 'untagged': '2'}
+            frametype = frametype_map.get(acceptable_frame_type, '0')
+
+            data = {
+                'cmd': 1292,
+                'XSSID': xssid,
+                'portlist': port_str,
+                'pvid': str(pvid),
+                'frametype': frametype,
+                'vlan_igrfilter': '1' if ingress_filtering else '0',
+                'vlan_trunk': '1' if vlan_trunking else '0',
+            }
+            code, _ = self.post_form(1292, data)
+            if code == 200:
+                success_count += 1
+
+        if success_count == len(port_settings):
+            return True, 'Configured %d ports' % success_count
+        return False, 'Failed to configure some ports (%d/%d)' % (success_count, len(port_settings))
 
     def _set_port_pvid_gs1915(self, port_id, pvid, num_ports, vlan_trunking=None,
                                ingress_filtering=None, acceptable_frame_type=None):
@@ -1665,11 +1848,725 @@ class HttpApi(HttpApiBase):
             return True, 'LAG configured'
         return False, 'Failed to configure LAG'
 
+    # =========================================================================
+    # SNMP Configuration Methods
+    # =========================================================================
+
+    def get_snmp_info(self):
+        """Get SNMP configuration from the switch.
+
+        Returns:
+            Dict with SNMP settings including:
+                - enabled: bool
+                - version: str (v1, v2c, v3)
+                - get_community: str
+                - set_community: str
+                - trap_community: str
+                - trap_destinations: list of dicts
+        """
+        model = self.detect_model()
+
+        if model == 'gs1900':
+            return self._get_snmp_info_gs1900()
+        elif model == 'gs1915':
+            return self._get_snmp_info_gs1915()
+        else:  # gs1920
+            return self._get_snmp_info_gs1920()
+
+    def _get_snmp_info_gs1920(self):
+        """Get SNMP info from GS1920."""
+        result = {
+            'enabled': False,
+            'version': 'v2c',
+            'get_community': 'public',
+            'set_community': 'public',
+            'trap_community': 'public',
+            'trap_destinations': [],
+        }
+
+        try:
+            content = self.get_page('/rpSnmp.html')
+
+            # Parse SNMP version select
+            version_match = re.search(
+                r'rpSnmp_Slt_Version[^>]*>.*?<OPTION[^>]*SELECTED[^>]*VALUE="(\d+)"',
+                content, re.IGNORECASE | re.DOTALL
+            )
+            if version_match:
+                ver_map = {'0': 'v1', '1': 'v2c', '2': 'v3'}
+                result['version'] = ver_map.get(version_match.group(1), 'v2c')
+
+            # Parse communities
+            get_match = re.search(
+                r'rpSnmp_Ipt_GetCommunity[^>]*VALUE="([^"]*)"',
+                content, re.IGNORECASE
+            )
+            if get_match:
+                result['get_community'] = get_match.group(1)
+
+            set_match = re.search(
+                r'rpSnmp_Ipt_SetCommunity[^>]*VALUE="([^"]*)"',
+                content, re.IGNORECASE
+            )
+            if set_match:
+                result['set_community'] = set_match.group(1)
+
+            trap_match = re.search(
+                r'rpSnmp_Ipt_TrapCommunity[^>]*VALUE="([^"]*)"',
+                content, re.IGNORECASE
+            )
+            if trap_match:
+                result['trap_community'] = trap_match.group(1)
+
+            result['enabled'] = True  # If we got this far, SNMP page is accessible
+
+        except Exception:
+            pass
+
+        return result
+
+    def _get_snmp_info_gs1915(self):
+        """Get SNMP info from GS1915."""
+        result = {
+            'enabled': False,
+            'version': 'v2c',
+            'get_community': 'public',
+            'set_community': 'public',
+            'trap_community': 'public',
+            'trap_destinations': [],
+        }
+
+        try:
+            content = self.get_page('/rpsnmp.html')  # lowercase for GS1915
+
+            # Parse communities - GS1915 uses different field names
+            get_match = re.search(
+                r'rpsnmp_IptGetCommunity[^>]*VALUE="([^"]*)"',
+                content, re.IGNORECASE
+            )
+            if get_match:
+                result['get_community'] = get_match.group(1)
+
+            set_match = re.search(
+                r'rpsnmp_IptSetCommunity[^>]*VALUE="([^"]*)"',
+                content, re.IGNORECASE
+            )
+            if set_match:
+                result['set_community'] = set_match.group(1)
+
+            trap_match = re.search(
+                r'rpsnmp_IptTrapCommunity[^>]*VALUE="([^"]*)"',
+                content, re.IGNORECASE
+            )
+            if trap_match:
+                result['trap_community'] = trap_match.group(1)
+
+            result['enabled'] = True
+
+        except Exception:
+            pass
+
+        return result
+
+    def _get_snmp_info_gs1900(self):
+        """Get SNMP info from GS1900."""
+        result = {
+            'enabled': False,
+            'version': 'v2c',
+            'get_community': 'public',
+            'set_community': 'public',
+            'trap_community': 'public',
+            'trap_destinations': [],
+        }
+
+        try:
+            # GS1900 SNMP page is cmd=768
+            content = self.get_page(768)
+
+            # Parse from form
+            get_match = re.search(r'name="getCommunity"[^>]*value="([^"]*)"', content, re.IGNORECASE)
+            if get_match:
+                result['get_community'] = get_match.group(1)
+
+            set_match = re.search(r'name="setCommunity"[^>]*value="([^"]*)"', content, re.IGNORECASE)
+            if set_match:
+                result['set_community'] = set_match.group(1)
+
+            result['enabled'] = True
+
+        except Exception:
+            pass
+
+        return result
+
+    def configure_snmp(self, config):
+        """Configure SNMP settings.
+
+        Args:
+            config: Dict with keys:
+                - enabled: bool, enable/disable SNMP
+                - version: str, SNMP version (v1, v2c, v3)
+                - get_community: str, read community string
+                - set_community: str, write community string
+                - trap_community: str, trap community string
+
+        Returns:
+            Tuple of (success, message)
+        """
+        model = self.detect_model()
+
+        if model == 'gs1900':
+            return self._configure_snmp_gs1900(config)
+        elif model == 'gs1915':
+            return self._configure_snmp_gs1915(config)
+        else:  # gs1920
+            return self._configure_snmp_gs1920(config)
+
+    def _configure_snmp_gs1920(self, config):
+        """Configure SNMP on GS1920 using read-modify-write pattern.
+
+        Note: Some GS1920 firmware versions may not have a web page for SNMP.
+        In that case, the feature is controlled via CLI only.
+        """
+        # STEP 1: READ current SNMP page - try multiple possible page names
+        page_names = ['/rpSnmp.html', '/rpsnmp.html', '/Snmp.html', '/snmp.html']
+        content = None
+
+        for page in page_names:
+            try:
+                content = self.get_page(page)
+                if content and 'Object Not Found' not in content:
+                    break
+                content = None
+            except Exception:
+                continue
+
+        if not content:
+            # Page not found - this is OK, SNMP is likely controlled via CLI only
+            return True, 'SNMP page not found on GS1920 (may require CLI configuration)'
+
+        # Parse current values
+        current = self._parse_form_inputs(content, r'rpSnmp_Ipt_\w+')
+        current_selects = self._parse_form_selects(content, r'rpSnmp_Slt_\w+')
+
+        # STEP 2: MODIFY - apply requested changes
+        if config.get('get_community') is not None:
+            current['rpSnmp_Ipt_GetCommunity'] = config['get_community']
+
+        if config.get('set_community') is not None:
+            current['rpSnmp_Ipt_SetCommunity'] = config['set_community']
+
+        if config.get('trap_community') is not None:
+            current['rpSnmp_Ipt_TrapCommunity'] = config['trap_community']
+
+        if config.get('version') is not None:
+            ver_map = {'v1': '0', 'v2c': '1', 'v3': '2'}
+            current_selects['rpSnmp_Slt_Version'] = ver_map.get(config['version'], '1')
+
+        # STEP 3: WRITE - build form with all current state
+        form_data = []
+
+        for field, value in current.items():
+            form_data.append((field, value))
+
+        for field, value in current_selects.items():
+            form_data.append((field, value))
+
+        form_data.append(('rpSnmp_HidBtn_NumID', '1'))
+
+        code, response = self.post_form('/Forms/rpSnmp_1', form_data)
+        if code == 200:
+            return True, 'SNMP configured'
+        return False, 'Failed to configure SNMP: HTTP %d' % code
+
+    def _configure_snmp_gs1915(self, config):
+        """Configure SNMP on GS1915 using read-modify-write pattern."""
+        try:
+            content = self.get_page('/rpsnmp.html')  # lowercase for GS1915
+        except Exception as e:
+            return False, 'Failed to get SNMP page: %s' % str(e)
+
+        # Parse current values - GS1915 uses different field naming
+        current = self._parse_form_inputs(content, r'rpsnmp_Ipt\w+')
+        current_selects = self._parse_form_selects(content, r'rpsnmp_Slt\w+')
+
+        # STEP 2: MODIFY
+        if config.get('get_community') is not None:
+            current['rpsnmp_IptGetCommunity'] = config['get_community']
+
+        if config.get('set_community') is not None:
+            current['rpsnmp_IptSetCommunity'] = config['set_community']
+
+        if config.get('trap_community') is not None:
+            current['rpsnmp_IptTrapCommunity'] = config['trap_community']
+
+        # STEP 3: WRITE
+        form_data = []
+
+        for field, value in current.items():
+            form_data.append((field, value))
+
+        for field, value in current_selects.items():
+            form_data.append((field, value))
+
+        form_data.append(('rpsnmp_HidBtnNum', '1'))
+
+        code, response = self.post_form('/Forms/rpsnmp_1', form_data)
+        if code == 200:
+            return True, 'SNMP configured'
+        return False, 'Failed to configure SNMP: HTTP %d' % code
+
+    def _configure_snmp_gs1900(self, config):
+        """Configure SNMP on GS1900."""
+        try:
+            # Get XSSID token
+            xssid = self._get_gs1900_xssid(768)
+
+            form_data = {
+                'cmd': 768,
+                'XSSID': xssid or '',
+            }
+
+            if config.get('get_community') is not None:
+                form_data['getCommunity'] = config['get_community']
+
+            if config.get('set_community') is not None:
+                form_data['setCommunity'] = config['set_community']
+
+            form_data['sysSubmit'] = 'Apply'
+
+            code, response = self.post_form(768, form_data)
+            if code == 200:
+                return True, 'SNMP configured'
+            return False, 'Failed to configure SNMP: HTTP %d' % code
+
+        except Exception as e:
+            return False, 'Failed to configure SNMP: %s' % str(e)
+
+    # =========================================================================
+    # Cloud/Nebula Configuration Methods
+    # =========================================================================
+
+    def get_cloud_info(self):
+        """Get cloud/Nebula configuration from the switch.
+
+        Returns:
+            Dict with cloud settings including:
+                - discovery_enabled: bool
+                - mode: str (standalone, cloud)
+        """
+        model = self.detect_model()
+
+        if model == 'gs1900':
+            return self._get_cloud_info_gs1900()
+        elif model == 'gs1915':
+            return self._get_cloud_info_gs1915()
+        else:  # gs1920
+            return self._get_cloud_info_gs1920()
+
+    def _get_cloud_info_gs1920(self):
+        """Get cloud info from GS1920."""
+        result = {
+            'discovery_enabled': True,  # Default to enabled (safer assumption)
+            'mode': 'standalone',
+        }
+
+        try:
+            content = self.get_page('/rpNebula.html')
+
+            # Parse discovery checkbox
+            discovery_match = re.search(
+                r'rpNebula_Chk_Discovery[^>]*CHECKED',
+                content, re.IGNORECASE
+            )
+            result['discovery_enabled'] = discovery_match is not None
+
+            # Parse mode select
+            mode_match = re.search(
+                r'rpNebula_Slt_Mode[^>]*>.*?<OPTION[^>]*SELECTED[^>]*VALUE="(\d+)"',
+                content, re.IGNORECASE | re.DOTALL
+            )
+            if mode_match:
+                mode_map = {'0': 'standalone', '1': 'cloud'}
+                result['mode'] = mode_map.get(mode_match.group(1), 'standalone')
+
+        except Exception:
+            pass
+
+        return result
+
+    def _get_cloud_info_gs1915(self):
+        """Get cloud info from GS1915."""
+        result = {
+            'discovery_enabled': True,
+            'mode': 'standalone',
+        }
+
+        try:
+            content = self.get_page('/rpnebula.html')  # lowercase for GS1915
+
+            discovery_match = re.search(
+                r'rpnebula_ChkDiscovery[^>]*CHECKED',
+                content, re.IGNORECASE
+            )
+            result['discovery_enabled'] = discovery_match is not None
+
+        except Exception:
+            pass
+
+        return result
+
+    def _get_cloud_info_gs1900(self):
+        """Get cloud info from GS1900.
+
+        Note: GS1900 may not have cloud/Nebula features.
+        """
+        return {
+            'discovery_enabled': False,
+            'mode': 'standalone',
+        }
+
+    def configure_cloud(self, config):
+        """Configure cloud/Nebula settings.
+
+        Args:
+            config: Dict with keys:
+                - discovery_enabled: bool, enable/disable Nebula discovery
+
+        Returns:
+            Tuple of (success, message)
+        """
+        model = self.detect_model()
+
+        if model == 'gs1900':
+            return True, 'GS1900 does not support cloud/Nebula configuration'
+        elif model == 'gs1915':
+            return self._configure_cloud_gs1915(config)
+        else:  # gs1920
+            return self._configure_cloud_gs1920(config)
+
+    def _configure_cloud_gs1920(self, config):
+        """Configure cloud/Nebula on GS1920.
+
+        Note: Some GS1920 firmware versions may not have a web page for cloud/Nebula.
+        In that case, the feature is controlled via CLI only.
+        """
+        # Try multiple possible page names
+        page_names = ['/rpNebula.html', '/rpnebula.html', '/rpCloud.html', '/rpcloud.html']
+        content = None
+
+        for page in page_names:
+            try:
+                content = self.get_page(page)
+                if content and 'Object Not Found' not in content:
+                    break
+                content = None
+            except Exception:
+                continue
+
+        if not content:
+            # Page not found - this is OK, cloud is likely controlled via CLI only
+            return True, 'Cloud/Nebula page not found on GS1920 (may require CLI configuration)'
+
+        # Parse current state
+        current = self._parse_form_inputs(content, r'rpNebula_\w+')
+        current_selects = self._parse_form_selects(content, r'rpNebula_Slt_\w+')
+
+        # Build form data
+        form_data = []
+
+        # Add discovery checkbox only if enabled
+        if config.get('discovery_enabled', False):
+            form_data.append(('rpNebula_Chk_Discovery', 'on'))
+        # If disabled, simply don't include the checkbox in the form data
+
+        for field, value in current.items():
+            if 'Chk_Discovery' not in field:  # Don't duplicate
+                form_data.append((field, value))
+
+        for field, value in current_selects.items():
+            form_data.append((field, value))
+
+        form_data.append(('rpNebula_HidBtn_NumID', '1'))
+
+        code, response = self.post_form('/Forms/rpNebula_1', form_data)
+        if code == 200:
+            return True, 'Cloud/Nebula configured'
+        return False, 'Failed to configure cloud: HTTP %d' % code
+
+    def _configure_cloud_gs1915(self, config):
+        """Configure cloud/Nebula on GS1915.
+
+        Note: Some GS1915 firmware versions may not have a web page for cloud/Nebula.
+        In that case, the feature is controlled via CLI only.
+        """
+        # Try multiple possible page names
+        page_names = ['/rpnebula.html', '/rpNebula.html', '/rpcloud.html', '/rpCloud.html']
+        content = None
+
+        for page in page_names:
+            try:
+                content = self.get_page(page)
+                if content and 'Object Not Found' not in content:
+                    break
+                content = None
+            except Exception:
+                continue
+
+        if not content:
+            # Page not found - this is OK, cloud is likely controlled via CLI only
+            # Return success since we can't configure it via web but it's not an error
+            return True, 'Cloud/Nebula page not found on GS1915 (may require CLI configuration)'
+
+        # Parse current state
+        current = self._parse_form_inputs(content, r'rpnebula_\w+')
+        current_selects = self._parse_form_selects(content, r'rpnebula_Slt\w+')
+
+        # Build form data
+        form_data = []
+
+        if config.get('discovery_enabled', False):
+            form_data.append(('rpnebula_ChkDiscovery', 'on'))
+
+        for field, value in current.items():
+            if 'ChkDiscovery' not in field:
+                form_data.append((field, value))
+
+        for field, value in current_selects.items():
+            form_data.append((field, value))
+
+        form_data.append(('rpnebula_HidBtnNum', '1'))
+
+        code, response = self.post_form('/Forms/rpnebula_1', form_data)
+        if code == 200:
+            return True, 'Cloud/Nebula configured'
+        return False, 'Failed to configure cloud: HTTP %d' % code
+
+    # =========================================================================
+    # Service Control Methods (enable/disable SNMP, Telnet, etc.)
+    # =========================================================================
+
+    def get_service_control_info(self):
+        """Get service control settings (which services are enabled).
+
+        Returns:
+            Dict with service states:
+                - snmp: bool
+                - telnet: bool
+                - ssh: bool
+                - http: bool
+                - https: bool
+        """
+        model = self.detect_model()
+
+        if model == 'gs1900':
+            return self._get_service_control_gs1900()
+        elif model == 'gs1915':
+            return self._get_service_control_gs1915()
+        else:  # gs1920
+            return self._get_service_control_gs1920()
+
+    def _get_service_control_gs1920(self):
+        """Get service control from GS1920."""
+        result = {
+            'snmp': False,
+            'telnet': False,
+            'ssh': True,
+            'http': True,
+            'https': True,
+        }
+
+        try:
+            content = self.get_page('/rpServiceControl.html')
+
+            # Parse checkboxes for each service
+            for service in ['snmp', 'telnet', 'ssh', 'http', 'https']:
+                pattern = r'rpServiceControl_Chk_%s[^>]*CHECKED' % service.capitalize()
+                match = re.search(pattern, content, re.IGNORECASE)
+                result[service] = match is not None
+
+        except Exception:
+            pass
+
+        return result
+
+    def _get_service_control_gs1915(self):
+        """Get service control from GS1915."""
+        result = {
+            'snmp': False,
+            'telnet': False,
+            'ssh': True,
+            'http': True,
+            'https': True,
+        }
+
+        try:
+            content = self.get_page('/rpservicecontrol.html')  # lowercase
+
+            for service in ['snmp', 'telnet', 'ssh', 'http', 'https']:
+                pattern = r'rpservicecontrol_Chk%s[^>]*CHECKED' % service.capitalize()
+                match = re.search(pattern, content, re.IGNORECASE)
+                result[service] = match is not None
+
+        except Exception:
+            pass
+
+        return result
+
+    def _get_service_control_gs1900(self):
+        """Get service control from GS1900."""
+        # GS1900 may not have a separate service control page
+        return {
+            'snmp': True,
+            'telnet': False,
+            'ssh': False,
+            'http': True,
+            'https': True,
+        }
+
+    def configure_service_control(self, config):
+        """Configure service control (enable/disable services).
+
+        Args:
+            config: Dict with service states:
+                - snmp: bool
+                - telnet: bool
+                - ssh: bool
+                - http: bool
+                - https: bool
+
+        Returns:
+            Tuple of (success, message)
+        """
+        model = self.detect_model()
+
+        if model == 'gs1900':
+            return True, 'GS1900 does not support service control configuration'
+        elif model == 'gs1915':
+            return self._configure_service_control_gs1915(config)
+        else:  # gs1920
+            return self._configure_service_control_gs1920(config)
+
+    def _configure_service_control_gs1920(self, config):
+        """Configure service control on GS1920.
+
+        Note: Some GS1920 firmware versions may not have a web page for service control.
+        In that case, the feature is controlled via CLI only.
+        """
+        # Try multiple possible page names
+        page_names = ['/rpServiceControl.html', '/rpservicecontrol.html', '/rpService.html']
+        content = None
+
+        for page in page_names:
+            try:
+                content = self.get_page(page)
+                if content and 'Object Not Found' not in content:
+                    break
+                content = None
+            except Exception:
+                continue
+
+        if not content:
+            # Page not found - this is OK, services are likely controlled via CLI only
+            return True, 'Service control page not found on GS1920 (may require CLI configuration)'
+
+        # Build form data - only include enabled services as checkboxes
+        form_data = []
+
+        service_field_map = {
+            'snmp': 'rpServiceControl_Chk_Snmp',
+            'telnet': 'rpServiceControl_Chk_Telnet',
+            'ssh': 'rpServiceControl_Chk_Ssh',
+            'http': 'rpServiceControl_Chk_Http',
+            'https': 'rpServiceControl_Chk_Https',
+        }
+
+        for service, field in service_field_map.items():
+            if config.get(service, False):
+                form_data.append((field, 'on'))
+
+        form_data.append(('rpServiceControl_HidBtn_NumID', '1'))
+
+        code, response = self.post_form('/Forms/rpServiceControl_1', form_data)
+        if code == 200:
+            return True, 'Service control configured'
+        return False, 'Failed to configure service control: HTTP %d' % code
+
+    def _configure_service_control_gs1915(self, config):
+        """Configure service control on GS1915.
+
+        Note: Some GS1915 firmware versions may not have a web page for service control.
+        In that case, the feature is controlled via CLI only.
+        """
+        # Try multiple possible page names
+        page_names = ['/rpservicecontrol.html', '/rpServiceControl.html', '/rpservice.html']
+        content = None
+
+        for page in page_names:
+            try:
+                content = self.get_page(page)
+                if content and 'Object Not Found' not in content:
+                    break
+                content = None
+            except Exception:
+                continue
+
+        if not content:
+            # Page not found - this is OK, services are likely controlled via CLI only
+            return True, 'Service control page not found on GS1915 (may require CLI configuration)'
+
+        form_data = []
+
+        service_field_map = {
+            'snmp': 'rpservicecontrol_ChkSnmp',
+            'telnet': 'rpservicecontrol_ChkTelnet',
+            'ssh': 'rpservicecontrol_ChkSsh',
+            'http': 'rpservicecontrol_ChkHttp',
+            'https': 'rpservicecontrol_ChkHttps',
+        }
+
+        for service, field in service_field_map.items():
+            if config.get(service, False):
+                form_data.append((field, 'on'))
+
+        form_data.append(('rpservicecontrol_HidBtnNum', '1'))
+
+        code, response = self.post_form('/Forms/rpservicecontrol_1', form_data)
+        if code == 200:
+            return True, 'Service control configured'
+        return False, 'Failed to configure service control: HTTP %d' % code
+
     def get_capabilities(self):
         """Return device capabilities."""
         model = self.detect_model()
         return {
-            'rpc': ['get_page', 'post_form', 'get_system_info', 'get_ports_info', 'get_vlans_info'],
+            'rpc': [
+                # Read operations
+                'get_page',
+                'post_form',
+                'get_system_info',
+                'get_ports_info',
+                'get_vlans_info',
+                'get_vlan_port_settings',
+                'get_vlan_tag_page',
+                'get_vlan_index',
+                'get_firmware_version',
+                'get_snmp_info',
+                'get_cloud_info',
+                'get_service_control_info',
+                # Write operations
+                'create_vlan',
+                'delete_vlan',
+                'set_port_pvid',
+                'set_all_port_pvids',
+                'configure_port',
+                'configure_system',
+                'configure_syslog',
+                'configure_lag',
+                'configure_snmp',
+                'configure_cloud',
+                'configure_service_control',
+            ],
             'network_api': 'httpapi',
             'device_info': {
                 'network_os': 'zyxel',
