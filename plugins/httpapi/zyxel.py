@@ -75,7 +75,13 @@ class HttpApi(HttpApiBase):
         self._logged_in = False
 
     def detect_model(self):
-        """Detect switch model from the login page."""
+        """Detect switch model from the login page.
+
+        Priority:
+        1. Cached model (if already detected)
+        2. Model set via ansible_zyxel_model or zyxel_model variable
+        3. Auto-detection from login page content
+        """
         if self._model:
             return self._model
 
@@ -86,16 +92,21 @@ class HttpApi(HttpApiBase):
             return self._model
 
         # Try to detect from login page
+        # GS1900 uses dispatcher.cgi?cmd=0, GS1915/GS1920 have model in root page
         try:
             response, response_data = self.connection.send('/', None, method='GET')
             content = to_text(response_data.getvalue())
 
-            if 'GS1900' in content:
+            # Check if this is a GS1900 (redirects to dispatcher.cgi)
+            if 'dispatcher.cgi' in content or 'cmd=0' in content:
+                # This is a GS1900 - uses CGI-based interface
                 self._model = 'gs1900'
             elif 'GS1915' in content:
                 self._model = 'gs1915'
             elif 'GS1920' in content:
                 self._model = 'gs1920'
+            elif 'GS1900' in content:
+                self._model = 'gs1900'
             else:
                 # Default to gs1920 form-based auth
                 self._model = 'gs1920'
@@ -456,21 +467,15 @@ class HttpApi(HttpApiBase):
             # GS1900 uses cmd=1283 for the AJAX VLAN list
             content = self.get_page('/cgi-bin/dispatcher.cgi?cmd=1283&pageindex=1')
             vlans = self._parse_vlans_info_gs1900(content)
-            # Get port PVID settings to determine untagged port membership
-            port_content = self.get_page('/cgi-bin/dispatcher.cgi?cmd=1290')
-            port_settings = self._parse_port_settings_gs1900(port_content)
-            # Build untagged port membership from PVID assignments
-            for port_id, settings in port_settings.items():
-                pvid = str(settings.get('pvid', 1))
-                if pvid in vlans:
-                    if port_id not in vlans[pvid]['untagged_ports']:
-                        vlans[pvid]['untagged_ports'].append(port_id)
-            # Sort port lists
+
+            # Get actual port membership for each VLAN from cmd=1293
             for vid in vlans:
-                vlans[vid]['untagged_ports'] = sorted(
-                    vlans[vid]['untagged_ports'],
-                    key=lambda x: int(x) if x.isdigit() else 0
-                )
+                membership = self._get_vlan_membership_gs1900(vid)
+                vlans[vid]['tagged_ports'] = membership['tagged_ports']
+                vlans[vid]['untagged_ports'] = membership['untagged_ports']
+                vlans[vid]['excluded_ports'] = membership.get('excluded_ports', [])
+                vlans[vid]['forbidden_ports'] = membership.get('forbidden_ports', [])
+
             return vlans
         elif model == 'gs1915':
             # GS1915 uses rpvlantag.html (lowercase) for VLAN list
@@ -562,6 +567,69 @@ class HttpApi(HttpApiBase):
             }
 
         return vlans
+
+    def _get_vlan_membership_gs1900(self, vid):
+        """Get port membership for a specific VLAN on GS1900.
+
+        Uses cmd=1293 with vid parameter to get port membership form.
+        Returns dict with 'tagged_ports' and 'untagged_ports' lists.
+
+        Membership values from form:
+          1 = Excluded/Forbidden
+          2 = Untagged (TX untagged)
+          3 = Tagged (TX tagged)
+        """
+        content = self.get_page('/cgi-bin/dispatcher.cgi?cmd=1293&vid=%s' % vid)
+        return self._parse_vlan_membership_gs1900(content)
+
+    def _parse_vlan_membership_gs1900(self, content):
+        """Parse VLAN port membership from cmd=1293 response.
+
+        The form has radio buttons for each port with values:
+          0 = Forbidden
+          1 = Excluded
+          2 = Tagged
+          3 = Untagged
+
+        Radio button name format: membership_N where N is 0-based port index
+        """
+        tagged_ports = []
+        untagged_ports = []
+        excluded_ports = []
+        forbidden_ports = []
+
+        # Parse each port's membership by finding checked radio buttons
+        # The HTML may have attributes in various orders, so find each input separately
+        for port_idx in range(16):  # Check up to 16 ports
+            # Find all radio buttons for this port's membership
+            # Pattern matches the entire input tag for membership_N
+            input_pattern = r'<input[^>]*name="membership_%d"[^>]*>' % port_idx
+            inputs = re.findall(input_pattern, content, re.IGNORECASE)
+
+            for input_tag in inputs:
+                # Check if this input has 'checked' attribute
+                if 'checked' in input_tag.lower():
+                    # Extract the value
+                    value_match = re.search(r'value="(\d+)"', input_tag, re.IGNORECASE)
+                    if value_match:
+                        membership = value_match.group(1)
+                        port_num = str(port_idx + 1)  # Convert to 1-based port number
+                        if membership == '2':
+                            tagged_ports.append(port_num)
+                        elif membership == '3':
+                            untagged_ports.append(port_num)
+                        elif membership == '1':
+                            excluded_ports.append(port_num)
+                        elif membership == '0':
+                            forbidden_ports.append(port_num)
+                    break  # Found the checked one for this port
+
+        return {
+            'tagged_ports': sorted(tagged_ports, key=lambda x: int(x)),
+            'untagged_ports': sorted(untagged_ports, key=lambda x: int(x)),
+            'excluded_ports': sorted(excluded_ports, key=lambda x: int(x)),
+            'forbidden_ports': sorted(forbidden_ports, key=lambda x: int(x))
+        }
 
     def _parse_port_settings_gs1900(self, content):
         """Parse port settings from GS1900 cmd=1290.
@@ -872,7 +940,7 @@ class HttpApi(HttpApiBase):
 
         model = self.detect_model()
         if model == 'gs1900':
-            success, msg = self._create_vlan_gs1900(vlan_id, vlan_name, tagged_ports, untagged_ports)
+            success, msg = self._create_vlan_gs1900(vlan_id, vlan_name, tagged_ports, untagged_ports, forbidden_ports)
         elif model == 'gs1915':
             success, msg = self._create_vlan_gs1915(vlan_id, vlan_name, tagged_ports, untagged_ports, forbidden_ports, num_ports)
         else:  # gs1920
@@ -990,30 +1058,126 @@ class HttpApi(HttpApiBase):
             return True, 'VLAN %s created' % vlan_id
         return False, 'Failed to create VLAN %s: HTTP %d' % (vlan_id, code)
 
-    def _create_vlan_gs1900(self, vlan_id, name, tagged_ports, untagged_ports):
-        """Create VLAN on GS1900 series.
+    def _create_vlan_gs1900(self, vlan_id, name, tagged_ports, untagged_ports,
+                               forbidden_ports=None):
+        """Create or update VLAN on GS1900 series.
 
         GS1900 uses cmd=1284 for the add form and cmd=1285 for submit.
         Form fields: vlanlist, name, XSSID
+
+        After creating the VLAN, set port membership using cmd=1294.
+        If VLAN already exists, skip creation and just update membership.
         """
-        # Get XSSID token from the add form (cmd=1284)
-        xssid = self._get_gs1900_xssid(1284)
-        if not xssid:
-            return False, 'Failed to get XSSID token for VLAN creation'
+        if forbidden_ports is None:
+            forbidden_ports = []
+
+        # Check if VLAN already exists by querying the VLAN list via our parser
+        try:
+            vlan_list_content = self.get_page('/cgi-bin/dispatcher.cgi?cmd=1283&pageindex=1')
+            existing_vlans = self._parse_vlans_info_gs1900(vlan_list_content)
+            vlan_exists = str(vlan_id) in existing_vlans
+        except Exception:
+            # If we can't query, assume VLAN doesn't exist
+            vlan_exists = False
+
+        if not vlan_exists:
+            # Get XSSID token from the add form (cmd=1284)
+            xssid = self._get_gs1900_xssid(1284)
+            if not xssid:
+                return False, 'Failed to get XSSID token for VLAN creation'
+
+            # GS1900 automatically appends the 4-digit VLAN ID to the name
+            # Our naming convention is NAME + 4-digit padded ID (e.g., "WIFIADMIN0104")
+            # So strip the last 4 characters to get just the name
+            vlan_name = name or 'VLAN'
+            if len(vlan_name) > 4:
+                vlan_name = vlan_name[:-4]
+
+            # Build form data
+            data = {
+                'cmd': 1285,  # Submit command
+                'XSSID': xssid,
+                'vlanlist': str(vlan_id),
+                'name': vlan_name,
+                'vlanAction': '0',  # 0=Add
+            }
+
+            code, response = self.post_form(1285, data)
+            if code != 200:
+                return False, 'Failed to create VLAN %s (vlan_exists=%s): HTTP %d' % (vlan_id, vlan_exists, code)
+
+        # Set port membership using cmd=1294 (both for new and existing VLANs)
+        if tagged_ports or untagged_ports or forbidden_ports:
+            success, msg = self._set_vlan_membership_gs1900(
+                vlan_id, tagged_ports, untagged_ports, forbidden_ports)
+            if not success:
+                action = 'created' if not vlan_exists else 'updated'
+                return False, 'VLAN %s %s but failed to set membership: %s' % (vlan_id, action, msg)
+
+        action = 'created' if not vlan_exists else 'updated'
+        return True, 'VLAN %s %s' % (vlan_id, action)
+
+    def _set_vlan_membership_gs1900(self, vlan_id, tagged_ports, untagged_ports,
+                                       forbidden_ports=None, num_ports=8):
+        """Set port membership for a VLAN on GS1900.
+
+        Uses cmd=1294 to submit port membership.
+        Membership values:
+          0 = Forbidden
+          1 = Excluded
+          2 = Tagged
+          3 = Untagged
+
+        Args:
+            vlan_id: VLAN ID to configure
+            tagged_ports: List of port numbers for tagged membership
+            untagged_ports: List of port numbers for untagged membership
+            forbidden_ports: List of port numbers to forbid (optional)
+            num_ports: Total number of ports on the switch (default 8 for GS1900-8HP)
+        """
+        if forbidden_ports is None:
+            forbidden_ports = []
+
+        # Get XSSID token from the membership form (cmd=1293)
+        content = self.get_page('/cgi-bin/dispatcher.cgi?cmd=1293&vid=%s' % vlan_id)
+        xssid_match = re.search(r'name="XSSID"\s+value="([^"]+)"', content, re.IGNORECASE)
+        if not xssid_match:
+            return False, 'Failed to get XSSID token for membership'
+        xssid = xssid_match.group(1)
+
+        # Detect number of ports from the form if possible
+        membership_count = len(re.findall(r'name="membership_\d+"', content, re.IGNORECASE))
+        if membership_count > 0:
+            num_ports = membership_count // 4  # 4 radio buttons per port
 
         # Build form data
         data = {
-            'cmd': 1285,  # Submit command
             'XSSID': xssid,
-            'vlanlist': str(vlan_id),
-            'name': name or ('VLAN%s' % vlan_id),
-            'vlanAction': '0',  # 0=Add
+            'vid': str(vlan_id),
+            'membership': '1',  # Default value for the summary field
+            'cmd': '1294',
+            'sysSubmit': 'Apply',
         }
 
-        code, response = self.post_form(1285, data)
+        # Set membership for each port (0-indexed in form)
+        # Membership values: 0=Forbidden, 1=Excluded, 2=Tagged, 3=Untagged
+        for port_idx in range(num_ports):
+            port_num = str(port_idx + 1)  # Convert to 1-based port number
+            data['vlanMode_%d' % port_idx] = '0'  # vlanMode is always 0
+
+            if port_num in [str(p) for p in forbidden_ports]:
+                data['membership_%d' % port_idx] = '0'  # Forbidden
+            elif port_num in [str(p) for p in tagged_ports]:
+                data['membership_%d' % port_idx] = '2'  # Tagged
+            elif port_num in [str(p) for p in untagged_ports]:
+                data['membership_%d' % port_idx] = '3'  # Untagged
+            else:
+                data['membership_%d' % port_idx] = '1'  # Excluded
+
+        code, response = self.post_form(1294, data)
         if code == 200:
-            return True, 'VLAN %s created' % vlan_id
-        return False, 'Failed to create VLAN %s: HTTP %d' % (vlan_id, code)
+            return True, 'VLAN %s membership configured' % vlan_id
+        return False, 'Failed to set VLAN %s membership: HTTP %d' % (vlan_id, code)
 
     def delete_vlan(self, vlan_id):
         """Delete a VLAN from the switch.
@@ -1085,16 +1249,37 @@ class HttpApi(HttpApiBase):
         return False, 'Failed to delete VLAN %s' % vlan_id
 
     def _delete_vlan_gs1900(self, vlan_id):
-        """Delete VLAN on GS1900 series."""
-        data = {
-            'cmd': 1282,
-            'vid': str(vlan_id),
-            'action': 'delete',
-        }
-        code, response = self.post_form(1282, data)
+        """Delete VLAN on GS1900 series.
+
+        GS1900 uses cmd=1289 with _del=VLAN_ID parameter as a GET request.
+        The delete link in the UI is:
+            /cgi-bin/dispatcher.cgi?cmd=1289&_del=VLAN_ID
+        """
+        # First check if VLAN exists
+        try:
+            vlan_list_content = self.get_page('/cgi-bin/dispatcher.cgi?cmd=1283&pageindex=1')
+            existing_vlans = self._parse_vlans_info_gs1900(vlan_list_content)
+            if str(vlan_id) not in existing_vlans:
+                return True, 'VLAN %s does not exist' % vlan_id
+        except Exception:
+            pass  # Continue with delete attempt
+
+        # GS1900 delete is a simple GET request to cmd=1289 with _del parameter
+        delete_url = '/cgi-bin/dispatcher.cgi?cmd=1289&_del=%s' % vlan_id
+        code, response = self.send_request(delete_url, method='GET')
+
         if code == 200:
-            return True, 'VLAN %s deleted' % vlan_id
-        return False, 'Failed to delete VLAN %s' % vlan_id
+            # Verify deletion by checking if VLAN still exists
+            try:
+                vlan_list_content = self.get_page('/cgi-bin/dispatcher.cgi?cmd=1283&pageindex=1')
+                existing_vlans = self._parse_vlans_info_gs1900(vlan_list_content)
+                if str(vlan_id) not in existing_vlans:
+                    return True, 'VLAN %s deleted' % vlan_id
+                else:
+                    return False, 'VLAN %s still exists after delete' % vlan_id
+            except Exception:
+                return True, 'VLAN %s deleted (verification failed)' % vlan_id
+        return False, 'Failed to delete VLAN %s: HTTP %d' % (vlan_id, code)
 
     def set_port_pvid(self, port_id, pvid, num_ports=28, vlan_trunking=None,
                        ingress_filtering=None, acceptable_frame_type=None):
